@@ -914,39 +914,31 @@ def _sigma_clipping(
         if std == 0.0:
             break
         # Mask outliers
-        mask = np.ones(len(intensities), dtype=np.bool_)
-        for i in range(len(intensities)):
-            if _sigma_clip(
-                intensities[i],
-                med,
-                std,
-                outlier_cutoff_lower,
-                outlier_cutoff_upper,
-            ):
-                mask[i] = False
+        mask = _sigma_clip(
+            intensities, med, std, outlier_cutoff_lower, outlier_cutoff_upper
+        )
         # Break if no outliers were found
         if np.sum(mask) == len(intensities):
             break
         intensities = intensities[mask]
-
     return intensities
 
 
 @nb.njit(cache=True)
 def _sigma_clip(
-    value: float,
+    values: np.ndarray,
     median: float,
     std: float,
     outlier_cutoff_lower: float,
     outlier_cutoff_upper: float,
-) -> bool:
+) -> np.ndarray:
     """
-    Check if a value is an outlier.
+    Label outlier intensities.
 
     Parameters
     ----------
-    value : float
-        The value to check.
+    values : np.ndarray
+        The values to check.
     median : float
         The median of the values.
     std : float
@@ -958,12 +950,14 @@ def _sigma_clip(
 
     Returns
     -------
-    bool
-        True if the value is an outlier, False otherwise
+    np.ndarray
+        mask:
+            True if the value is not an outlier (keep)
+            False otherwise (remove)
     """
-    return (value < median - outlier_cutoff_lower * std) or (
-        value > median + outlier_cutoff_upper * std
-    )
+    lower_bound = median - outlier_cutoff_lower * std
+    upper_bound = median + outlier_cutoff_upper * std
+    return (values >= lower_bound) & (values <= upper_bound)
 
 
 @nb.njit(cache=True)
