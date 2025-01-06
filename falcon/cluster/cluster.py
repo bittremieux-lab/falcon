@@ -734,14 +734,15 @@ def _get_cluster_average(
             avg_rt = np.mean(rts[start_i:stop_i])
 
             # Bin the spectra
-            bins_idx, bins_peaks = _spectrum_binning(
-                spectra_to_average, outlier_cutoff_lower, max_mz, bin_size
+            bins_idx, bins_peaks, bins_mz = _spectrum_binning(
+                spectra_to_average, min_mz, max_mz, bin_size
             )
             del spectra_to_average
             # Outlier rejection
-            bins_idx, bins_peaks = _outlier_rejection(
+            bins_idx, bins_peaks, bins_mz = _outlier_rejection(
                 bins_idx,
                 bins_peaks,
+                bins_mz,
                 outlier_cutoff_lower,
                 outlier_cutoff_upper,
             )
@@ -749,6 +750,7 @@ def _get_cluster_average(
             avg_spectrum = _construct_average_spectrum(
                 bins_idx,
                 bins_peaks,
+                bins_mz,
                 avg_mz,
                 charge,
                 outlier_cutoff_lower,
@@ -806,9 +808,12 @@ def _spectrum_binning(
 
     bins_indices = -np.ones(n_bins, dtype=np.int32)
     bins_peaks = nb.typed.List()
+    bins_mz = nb.typed.List()
     for _ in range(n_bins):
-        nested_list = nb.typed.List.empty_list(nb.types.float32)
-        bins_peaks.append(nested_list)
+        nested_list_p = nb.typed.List.empty_list(nb.types.float32)
+        nested_list_m = nb.typed.List.empty_list(nb.types.float32)
+        bins_peaks.append(nested_list_p)
+        bins_mz.append(nested_list_m)
 
     for spec in spectra:
         for mz, intensity in zip(spec.mz, spec.intensity):
@@ -817,6 +822,7 @@ def _spectrum_binning(
                 if bins_indices[bin_idx] == -1:
                     bins_indices[bin_idx] = bin_idx
                 bins_peaks[bin_idx].append(intensity)
+                bins_mz[bin_idx].append(mz)
     # Mark peaks that appear in less than 70% of the spectra as empty for removal
     for i in range(n_bins):
         if bins_indices[i] != -1:
@@ -826,16 +832,19 @@ def _spectrum_binning(
     mask = bins_indices != -1
     bins_indices = bins_indices[mask]
     bins_peaks_nb = nb.typed.List()
+    bins_mz_nb = nb.typed.List()
     for i in bins_indices:
         bins_peaks_nb.append(typed_list_to_numpy(bins_peaks[i]))
+        bins_mz_nb.append(typed_list_to_numpy(bins_mz[i]))
 
-    return bins_indices, bins_peaks_nb
+    return bins_indices, bins_peaks_nb, bins_mz_nb
 
 
 @nb.njit(cache=True)
 def _outlier_rejection(
     bins_indices: List[int],
     bins_peaks: nb.typed.List,
+    bins_mz: nb.typed.List,
     outlier_cutoff_lower: float,
     outlier_cutoff_upper: float,
 ) -> Tuple[nb.typed.List]:
@@ -849,6 +858,8 @@ def _outlier_rejection(
         The indices of the non-empty bins.
     bins_peaks : nb.typed.List
         The intensities for each bin.
+    bins_mz : nb.typed.List
+        The m/z values for each bin.
     outlier_cutoff_lower : float
         The number of standard deviations for the lower bound.
     outlier_cutoff_upper : float
@@ -861,33 +872,40 @@ def _outlier_rejection(
     """
     n_peaks = len(bins_indices)
     cleaned_bins_peaks = np.zeros(n_peaks, dtype=np.float32)
+    cleaned_bins_mz = np.zeros(n_peaks, dtype=np.float32)
 
     zero_peaks = np.zeros(len(bins_indices), dtype=np.bool_)
     for i in range(len(bins_indices)):
         intensities = bins_peaks[i]
+        mzs = bins_mz[i]
         if len(intensities) > 2:
-            clipped = _sigma_clipping(
+            clipped_p, clipped_m = _sigma_clipping(
                 intensities,
+                mzs,
                 outlier_cutoff_lower,
                 outlier_cutoff_upper,
             )
-            if len(clipped) < 1:
+            if len(clipped_p) < 1:
                 zero_peaks[i] = True
             else:
-                cleaned_bins_peaks[i] = np.mean(clipped)
+                cleaned_bins_peaks[i] = np.mean(clipped_p)
+                cleaned_bins_mz[i] = np.mean(clipped_m)
         else:
             cleaned_bins_peaks[i] = np.mean(intensities)
+            cleaned_bins_mz[i] = np.mean(mzs)
 
     # Return non-empty bins
     return (
         bins_indices[~zero_peaks],
         cleaned_bins_peaks[~zero_peaks],
+        cleaned_bins_mz[~zero_peaks],
     )
 
 
 @nb.njit(cache=True)
 def _sigma_clipping(
     intensities: np.ndarray,
+    mzs: np.ndarray,
     outlier_cutoff_lower: float,
     outlier_cutoff_upper: float,
 ) -> np.ndarray:
@@ -898,6 +916,8 @@ def _sigma_clipping(
     ----------
     intensities : np.ndarray
         The array of intensities.
+    mzs : np.ndarray
+        The array of m/z values.
     outlier_cutoff_lower : float
         The number of standard deviations for the lower bound.
     outlier_cutoff_upper : float
@@ -921,7 +941,8 @@ def _sigma_clipping(
         if np.sum(mask) == len(intensities):
             break
         intensities = intensities[mask]
-    return intensities
+        mzs = mzs[mask]
+    return intensities, mzs
 
 
 @nb.njit(cache=True)
@@ -964,10 +985,9 @@ def _sigma_clip(
 def _construct_average_spectrum(
     bins_indices: List[int],
     bins_peaks: nb.typed.List,
+    bins_mz: nb.typed.List,
     avg_precursor_mz: float,
     charge: int,
-    min_mz: float,
-    bin_size: float,
     avg_rt: float,
     cluster: int,
 ) -> similarity.SpectrumTuple:
@@ -980,14 +1000,12 @@ def _construct_average_spectrum(
         The indices of the non-empty bins.
     bins_peaks : nb.typed.List
         The intensities for each bin.
+    bins_mz : nb.typed.List
+        The m/z values for each bin
     avg_precursor_mz : float
         The average precursor m/z.
     charge : int
         The precursor charge.
-    min_mz : float
-        The minimum m/z to include in the vectors.
-    bin_size : float
-        The bin size in m/z used to divide the m/z range.
     avg_rt : float
         The average retention time.
     cluster : int
@@ -1002,9 +1020,9 @@ def _construct_average_spectrum(
     intensity = np.empty(len(bins_indices), np.float32)
 
     idx = 0
-    for bin_idx, avg_intensity in zip(bins_indices, bins_peaks):
+    for avg_intensity, avg_mz in zip(bins_peaks, bins_mz):
         # use the middle of the bin as the m/z value
-        mz[idx] = min_mz + (bin_idx * bin_size) + (bin_size / 2)
+        mz[idx] = avg_mz
         intensity[idx] = avg_intensity
         idx += 1
 
