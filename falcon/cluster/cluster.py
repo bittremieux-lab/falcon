@@ -160,27 +160,33 @@ def generate_clusters(
                 rep_spectra.append(rep_spectrum)
                 pbar.update(1)
             # Process two-spectrum m/z splits
-            for rep_spectra_chunk in joblib.Parallel(
-                n_jobs=multiprocessing.cpu_count(), backend="threading"
-            )(
-                joblib.delayed(cluster_2_spectra)(
-                    spec_tuples[spec_idx],
-                    spec_tuples[spec_idx + 1],
-                    rt[spec_idx],
-                    rt[spec_idx + 1],
-                    fragment_tol,
-                    distance_threshold,
-                    min_matches,
-                    consensus_method,
-                    min_mz,
-                    max_mz,
-                    bin_size,
-                    n_min,
-                    n_max,
+            for i, rep_spectra_chunk in enumerate(
+                joblib.Parallel(
+                    n_jobs=multiprocessing.cpu_count(), backend="threading"
+                )(
+                    joblib.delayed(cluster_2_spectra)(
+                        spec_tuples[spec_idx],
+                        spec_tuples[spec_idx + 1],
+                        rt[spec_idx],
+                        rt[spec_idx + 1],
+                        fragment_tol,
+                        distance_threshold,
+                        min_matches,
+                        consensus_method,
+                        min_mz,
+                        max_mz,
+                        bin_size,
+                        n_min,
+                        n_max,
+                    )
+                    for _, spec_idx in two_spectra_tasks
                 )
-                for _, spec_idx in two_spectra_tasks
             ):
                 rep_spectra.extend(rep_spectra_chunk)
+                # Clustered two spectra into one cluster.
+                if len(rep_spectra_chunk) == 1:
+                    spec_idx = two_spectra_tasks[i][1]
+                    cluster_labels[spec_idx : spec_idx + 2] = 0
                 pbar.update(2)
             # Process chunks
             process_chunk = partial(
@@ -212,20 +218,19 @@ def generate_clusters(
                 for split_result in chunk_results
             ]
             flattened_results.sort(key=lambda x: x[0])
-            labels_assigned = 0
-            for _, (interval_rep_spectra, labels) in flattened_results:
+            for task_id, (interval_rep_spectra, labels) in flattened_results:
                 if interval_rep_spectra is not None:
                     rep_spectra.extend(interval_rep_spectra)
-                    cluster_labels[
-                        labels_assigned : labels_assigned + len(labels)
-                    ] = labels
-                    labels_assigned += len(labels)
+                    cluster_labels[splits[task_id] : splits[task_id + 1]] = (
+                        labels
+                    )
             max_label = _assign_global_cluster_labels(
                 cluster_labels, splits, max_label
             )
         cluster_labels.flush()
         noise_mask = cluster_labels == -1
-        n_clusters, n_noise = np.amax(cluster_labels) + 1, noise_mask.sum()
+        n_clusters = np.unique(cluster_labels[~noise_mask]).size
+        n_noise = noise_mask.sum()
         logger.info(
             "%d spectra grouped in %d clusters, %d spectra remain as singletons",
             (cluster_labels != -1).sum(),
@@ -1424,13 +1429,18 @@ def _assign_global_cluster_labels(
         Last cluster label.
     """
     max_label = current_label
+    update_current_label = False
     for i in range(len(splits) - 1):
         for j in range(splits[i], splits[i + 1]):
             if cluster_labels[j] != -1:
                 cluster_labels[j] += current_label
+                update_current_label = True
                 if cluster_labels[j] > max_label:
                     max_label = cluster_labels[j]
-        current_label = max_label + 1
+        # only update after non-noise clusters
+        if update_current_label:
+            current_label = max_label + 1
+            update_current_label = False
     return max_label
 
 
