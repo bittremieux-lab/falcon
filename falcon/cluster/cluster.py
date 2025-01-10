@@ -119,7 +119,7 @@ def generate_clusters(
     )
     # Cluster per contiguous block of precursor m/z's (relative to the
     # precursor m/z threshold).
-    logging.info(
+    logger.info(
         "Cluster %d spectra with charge %s",
         len(data),
         dataset.uri.split("_")[-1].split(".")[0],
@@ -1467,30 +1467,38 @@ def compute_condensed_distance_matrix(
         The condensed pairwise distance matrix.
     """
     n = len(spec_tuples)
-    condensed_dist_matrix = np.zeros(n * (n - 1) // 2)
-
-    def worker(i, j):
-        spec_tup1 = spec_tuples[i]
-        spec_tup2 = spec_tuples[j]
-        sim, n_match = similarity.cosine_fast(
-            spec_tup1, spec_tup2, fragment_mz_tol
+    # condensed_dist_matrix = np.zeros(n * (n - 1) // 2)
+    with tempfile.NamedTemporaryFile(suffix=".npy") as pdist_file:
+        pdist_filename = pdist_file.name
+        condensed_dist_matrix = np.lib.format.open_memmap(
+            pdist_filename,
+            mode="w+",
+            dtype=np.float32,
+            shape=(n * (n - 1) // 2,),
         )
-        if n_match < min_matches:
-            sim = 0.0
-        distance = 1.0 - sim
-        idx = condensed_index(i, j, n)
-        condensed_dist_matrix[idx] = distance
 
-    with ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(worker, i, j)
-            for i in range(n - 1)
-            for j in range(i + 1, n)
-        ]
-        for future in futures:
-            future.result()
+        def worker(i, j):
+            spec_tup1 = spec_tuples[i]
+            spec_tup2 = spec_tuples[j]
+            sim, n_match = similarity.cosine_fast(
+                spec_tup1, spec_tup2, fragment_mz_tol
+            )
+            if n_match < min_matches:
+                sim = 0.0
+            distance = 1.0 - sim
+            idx = condensed_index(i, j, n)
+            condensed_dist_matrix[idx] = distance
 
-    return condensed_dist_matrix
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(worker, i, j)
+                for i in range(n - 1)
+                for j in range(i + 1, n)
+            ]
+            for future in futures:
+                future.result()
+
+        return condensed_dist_matrix
 
 
 @nb.njit
