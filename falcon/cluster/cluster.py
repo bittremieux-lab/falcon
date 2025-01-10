@@ -753,8 +753,6 @@ def _get_cluster_average(
                 bins_mz,
                 avg_mz,
                 charge,
-                outlier_cutoff_lower,
-                bin_size,
                 avg_rt,
                 labels[start_i],
             )
@@ -814,8 +812,10 @@ def _spectrum_binning(
         nested_list_m = nb.typed.List.empty_list(nb.types.float32)
         bins_peaks.append(nested_list_p)
         bins_mz.append(nested_list_m)
+    bins_spectra_count = np.zeros(n_bins, dtype=np.int32)
 
     for spec in spectra:
+        bins_peak_presence = np.zeros(n_bins, dtype=np.int32)
         for mz, intensity in zip(spec.mz, spec.intensity):
             bin_idx = math.floor((mz - min_mz) / bin_size)
             if 0 <= bin_idx < n_bins:
@@ -823,10 +823,12 @@ def _spectrum_binning(
                     bins_indices[bin_idx] = bin_idx
                 bins_peaks[bin_idx].append(intensity)
                 bins_mz[bin_idx].append(mz)
+                bins_peak_presence[bin_idx] = 1
+        bins_spectra_count += bins_peak_presence
     # Mark peaks that appear in less than 70% of the spectra as empty for removal
     for i in range(n_bins):
         if bins_indices[i] != -1:
-            if len(bins_peaks[i]) < 0.7 * n_spectra:
+            if len(bins_spectra_count[i]) < 0.7 * n_spectra:
                 bins_indices[i] = -1
     # Remove empty bins
     mask = bins_indices != -1
