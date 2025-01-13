@@ -549,6 +549,7 @@ def _cluster_mz_interval(
         # Refine initial clusters to make sure spectra within a cluster don't
         # have an excessive precursor m/z difference.
         order = np.argsort(labels)
+        rev_order = np.argsort(order)
         idx_interval, mzs_interval, rts_interval = (
             idx_interval[order],
             mzs_interval[order],
@@ -568,8 +569,8 @@ def _cluster_mz_interval(
             )
             current_label += n_clusters
         # Assign cluster labels.
-        # cluster_labels[idx_interval] = labels
-        cluster_labels = labels
+        # Returned cluster labels should be sorted by precursor mass.
+        cluster_labels = labels[rev_order]
         if current_label > 0:
             # Compute cluster medoids.
             order_ = np.argsort(labels)
@@ -842,9 +843,11 @@ def _postprocess_cluster(
             labels = nb.typed.Dict.empty(
                 key_type=nb.int64, value_type=nb.int64
             )
+            # Count cluster sizes
             for i, label in enumerate(cluster_assignments):
                 labels[label] = labels.get(label, 0) + 1
             n_clusters = 0
+            # Assign unique cluster labels
             for label, count in labels.items():
                 if count < min_samples:
                     labels[label] = -1
