@@ -1,3 +1,4 @@
+import collections
 import gc
 import logging
 import math
@@ -20,6 +21,18 @@ from . import similarity
 
 logger = logging.getLogger("falcon")
 
+ConsensusTuple = collections.namedtuple(
+    "ConsensusTuple",
+    [
+        "precursor_mz",
+        "precursor_charge",
+        "mz",
+        "intensity",
+        "retention_time",
+        "cluster_id",
+    ],
+)
+
 
 def generate_clusters(
     dataset: lance.LanceDataset,
@@ -31,6 +44,8 @@ def generate_clusters(
     rt_tol: float,
     fragment_tol: float,
     batch_size: int,
+    consensus_method: str,
+    consensus_params: dict,
 ) -> np.ndarray:
     """
     Hierarchical clustering of the given pairwise distance matrix.
@@ -56,6 +71,11 @@ def generate_clusters(
         The fragment m/z tolerance.
     batch_size : int
         Maximum interval size.
+    consensus_method : str
+        The method to use for consensus spectrum computation. Should be either
+        'medoid' or 'average'.
+    consensus_params : dict
+        Additional parameters for the consensus spectrum computation.
 
     Returns
     -------
@@ -97,7 +117,7 @@ def generate_clusters(
             cluster_filename, mode="w+", dtype=np.int32, shape=(data.shape[0],)
         )
         cluster_labels.fill(-1)
-        max_label, medoids = 0, []
+        max_label, rep_spectra = 0, []
         with tqdm(
             total=len(data), desc="Clustering", unit="spectra", smoothing=0
         ) as pbar:
@@ -112,7 +132,7 @@ def generate_clusters(
             ).tolist()
             del data
             # Per-split cluster labels.
-            for interval_medoids in joblib.Parallel(
+            for interval_rep_spectra in joblib.Parallel(
                 n_jobs=-1, backend="threading"
             )(
                 joblib.delayed(_cluster_interval)(
@@ -130,17 +150,18 @@ def generate_clusters(
                     precursor_tol_mode,
                     rt_tol,
                     fragment_tol,
+                    consensus_method,
+                    consensus_params,
                     pbar,
                 )
                 for i in range(len(splits) - 1)
             ):
-                if interval_medoids is not None:
-                    medoids.append(interval_medoids)
+                if interval_rep_spectra is not None:
+                    rep_spectra.extend(interval_rep_spectra)
             max_label = _assign_global_cluster_labels(
                 cluster_labels, idx, splits, max_label
             )
         cluster_labels.flush()
-        medoids = np.hstack(medoids)
         noise_mask = cluster_labels == -1
         n_clusters, n_noise = np.amax(cluster_labels) + 1, noise_mask.sum()
         logger.info(
@@ -153,7 +174,7 @@ def generate_clusters(
         cluster_labels[noise_mask] = np.arange(
             n_clusters, n_clusters + n_noise
         )
-        return cluster_labels, medoids
+        return cluster_labels, rep_spectra
 
 
 @nb.njit
@@ -224,6 +245,8 @@ def _cluster_interval(
     precursor_tol_mode: str,
     rt_tol: float,
     fragment_mz_tol: float,
+    consensus_method: str,
+    consensus_params: dict,
     pbar: tqdm,
 ) -> np.ndarray:
     """
@@ -261,6 +284,11 @@ def _cluster_interval(
         `None`, do not restrict the retention time.
     fragment_mz_tol : float
         The fragment m/z tolerance.
+    consensus_method : str
+        The method to use for consensus spectrum computation. Should be either
+        'medoid' or 'average'.
+    consensus_params : dict
+        Additional parameters for the consensus spectrum computation.
     pbar : tqdm.tqdm
         Tqdm progress bar.
 
@@ -269,8 +297,8 @@ def _cluster_interval(
     np.ndarray
         List with indexes of the medoids for each cluster.
     """
-    n_vectors = interval_stop - interval_start
-    if n_vectors > 1:
+    n_spectra = interval_stop - interval_start
+    if n_spectra > 1:
         idx_interval = idx[interval_start:interval_stop]
         mzs_interval = mzs[interval_start:interval_stop]
         rts_interval = rts[interval_start:interval_stop]
@@ -314,21 +342,44 @@ def _cluster_interval(
         if current_label > 0:
             # Compute cluster medoids.
             order_ = np.argsort(labels)
-            idx_interval, labels = idx_interval[order_], labels[order_]
+            idx_interval = idx_interval[order_]
+            labels = labels[order_]
+            rts_interval = rts_interval[order_]
             order_map = order[order_]
-            medoids = _get_cluster_medoids(
-                idx_interval, labels, pdist, order_map
+            if consensus_method == "medoid":
+                consensus_params["pdist"] = pdist
+            rep_spectra = _get_representative_spectra(
+                spectra[interval_start:interval_stop],
+                labels,
+                rts_interval,
+                order_map,
+                consensus_method,
+                consensus_params,
             )
         else:
-            medoids = range(interval_start, interval_stop)
+            rep_spectra = spectra[interval_start:interval_stop]
+            rep_spectra = [
+                ConsensusTuple(
+                    *spec,
+                    retention_time=rts_interval[i],
+                    cluster_id=-1,
+                )
+                for i, spec in enumerate(rep_spectra)
+            ]
         # Force memory clearing.
         del pdist
-        if n_vectors > 2**11:
+        if n_spectra > 2**11:
             gc.collect()
     else:
-        medoids = [interval_start]
-    pbar.update(n_vectors)
-    return medoids
+        rep_spectra = [
+            ConsensusTuple(
+                *spectra[interval_start],
+                retention_time=rts[0],
+                cluster_id=-1,
+            )
+        ]
+    pbar.update(n_spectra)
+    return rep_spectra
 
 
 @nb.njit
@@ -509,13 +560,63 @@ def _linkage(values: np.ndarray, tol_mode: str = None) -> np.ndarray:
     return linkage
 
 
+def _get_representative_spectra(
+    spectra: List[similarity.SpectrumTuple],
+    labels: np.ndarray,
+    rts: np.ndarray,
+    order_map: np.ndarray,
+    consensus_method: str,
+    consensus_params: dict,
+) -> List[ConsensusTuple]:
+    """
+    Get the representative spectra for each cluster.
+
+    Parameters
+    ----------
+    spectra : List[similarity.SpectrumTuple]
+        The spectra.
+    labels : np.ndarray
+        Cluster labels.
+    rts : np.ndarray
+        The retention times corresponding to the current interval indexes.
+        order_map : np.ndarray
+        Map to convert label indexes to pairwise distance matrix indexes.
+    consensus_method : str
+        The method to use for consensus spectrum computation.
+    consensus_params : dict
+        Additional parameters for the consensus spectrum computation.
+
+    Returns
+    -------
+    List[ConsensusTuple]
+        The representative spectra for each cluster.
+    """
+    if consensus_method == "medoid":
+        return _get_cluster_medoids(
+            spectra, labels, rts, order_map, **consensus_params
+        )
+    elif consensus_method == "average":
+        return _get_cluster_average(
+            spectra,
+            labels,
+            rts,
+            order_map,
+            **consensus_params,
+        )
+    else:
+        raise ValueError(
+            f"Unknown consensus spectrum method: {consensus_method}"
+        )
+
+
 @nb.njit(fastmath=True, boundscheck=False)
 def _get_cluster_medoids(
-    idx_interval: np.ndarray,
+    spectra: List[similarity.SpectrumTuple],
     labels: np.ndarray,
-    pdist: np.ndarray,
+    rts: np.ndarray,
     order_map: np.ndarray,
-) -> np.ndarray:
+    pdist: np.ndarray,
+) -> List[ConsensusTuple]:
     """
     Get the indexes of the cluster medoids.
 
@@ -525,6 +626,8 @@ def _get_cluster_medoids(
         vector indexes.
     labels : np.ndarray
         Cluster labels.
+    rts: np.ndarray
+        The retention times corresponding to the current interval indexes.
     pdist : np.ndarray
         Condensed pairwise distance matrix.
     order_map : np.ndarray
@@ -532,10 +635,10 @@ def _get_cluster_medoids(
 
     Returns
     -------
-    np.ndarray
-        Array with indexes of the medoids for each cluster.
+    List[ConsensusTuple]
+        The medoids for each cluster.
     """
-    medoids, m = [], len(idx_interval)
+    medoids, m = [], len(spectra)
     for start_i, stop_i in _get_cluster_group_idx(labels):
         if stop_i - start_i > 1:
             row_sum = np.zeros(stop_i - start_i, np.float32)
@@ -547,10 +650,414 @@ def _get_cluster_medoids(
                     pdist_ij = pdist[m * i + j - ((i + 2) * (i + 1)) // 2]
                     row_sum[row] += pdist_ij
                     row_sum[col] += pdist_ij
-            medoids.append(idx_interval[start_i + np.argmin(row_sum)])
+            medoid_idx = start_i + np.argmin(row_sum)
+            medoid_spec = spectra[medoid_idx]
+            medoids.append(
+                ConsensusTuple(
+                    precursor_mz=medoid_spec.precursor_mz,
+                    precursor_charge=medoid_spec.precursor_charge,
+                    mz=medoid_spec.mz,
+                    intensity=medoid_spec.intensity,
+                    retention_time=rts[medoid_idx],
+                    cluster_id=labels[medoid_idx],
+                )
+            )
         else:
-            medoids.append(idx_interval[start_i])
-    return np.asarray(medoids, dtype=np.int32)
+            medoid_spec = spectra[start_i]
+            medoids.append(
+                ConsensusTuple(
+                    precursor_mz=medoid_spec.precursor_mz,
+                    precursor_charge=medoid_spec.precursor_charge,
+                    mz=medoid_spec.mz,
+                    intensity=medoid_spec.intensity,
+                    retention_time=rts[start_i],
+                    cluster_id=labels[start_i],
+                )
+            )
+    return medoids
+
+
+def _get_cluster_average(
+    spectra: List[similarity.SpectrumTuple],
+    labels: np.ndarray,
+    rts: np.ndarray,
+    order_map: np.ndarray,
+    min_mz: float,
+    max_mz: float,
+    bin_size: float,
+    outlier_cutoff_lower: float,
+    outlier_cutoff_upper: float,
+) -> List[ConsensusTuple]:
+    """
+    Get the average spectra for each cluster. The average spectrum is computed
+    by binning the spectra, removing (intensity) outliers in each bin, and averaging the remaining peaks.
+    Adapted from Carr, A. V. et al. Proteomics (2024).
+    https://analyticalsciencejournals.onlinelibrary.wiley.com/doi/10.1002/pmic.202300234.
+
+    Parameters
+    ----------
+    spectra : List[similarity.SpectrumTuple]
+        The spectra.
+    labels : np.ndarray
+        Cluster labels.
+    rts : np.ndarray
+        The retention times corresponding to the current interval indexes.
+    order_map : np.ndarray
+        Map to convert label indexes to pairwise distance matrix indexes.
+    min_mz : float
+        The minimum m/z value to consider for binning.
+    max_mz : float
+        The maximum m/z value to consider for binning.
+    bin_size : float
+        The width of each bin in m/z units.
+    outlier_cutoff_lower : float
+        The number of standard deviations for the lower bound for outlier rejection.
+    outlier_cutoff_upper : float
+        The number of standard deviations for the upper bound for outlier rejection.
+
+    Returns
+    -------
+    List[ConsensusTuple]
+        The average spectra for each cluster.
+    """
+    average_spectra = []
+    for start_i, stop_i in _get_cluster_group_idx(labels):
+        if stop_i - start_i > 1:
+            spectra_to_average = [
+                spectra[order_map[i]] for i in range(start_i, stop_i)
+            ]
+            # average precursor mz
+            avg_mz = np.mean(
+                [spec.precursor_mz for spec in spectra_to_average], axis=0
+            )
+            charge = spectra_to_average[0].precursor_charge
+            avg_rt = np.mean(rts[start_i:stop_i])
+
+            # Bin the spectra
+            bins_idx, bins_peaks, bins_mz = _spectrum_binning(
+                spectra_to_average, min_mz, max_mz, bin_size
+            )
+            del spectra_to_average
+            # Outlier rejection
+            bins_idx, bins_peaks, bins_mz = _outlier_rejection(
+                bins_idx,
+                bins_peaks,
+                bins_mz,
+                outlier_cutoff_lower,
+                outlier_cutoff_upper,
+            )
+            # Construct average spectrum
+            avg_spectrum = _construct_average_spectrum(
+                bins_idx,
+                bins_peaks,
+                bins_mz,
+                avg_mz,
+                charge,
+                avg_rt,
+                labels[start_i],
+            )
+            average_spectra.append(avg_spectrum)
+        else:
+            # Single spectrum cluster
+            avg_spectrum = spectra[order_map[start_i]]
+            average_spectra.append(
+                ConsensusTuple(
+                    *avg_spectrum,
+                    retention_time=rts[start_i],
+                    cluster_id=labels[start_i],
+                )
+            )
+    return average_spectra
+
+
+@nb.njit(cache=True)
+def _spectrum_binning(
+    spectra: List[similarity.SpectrumTuple],
+    min_mz: float,
+    max_mz: float,
+    bin_size: float,
+) -> Tuple[List[int], nb.typed.List]:
+    """
+    Jointly bin multiple spectra into fixed-size bins based on m/z values.
+
+    Parameters
+    ----------
+    spectra : List[similarity.SpectrumTuple]
+        A list of spectra to be binned.
+    min_mz : float
+        The minimum m/z value to consider for binning.
+    max_mz : float
+        The maximum m/z value to consider for binning.
+    bin_size : float
+        The width of each bin in m/z units.
+
+    Returns
+    -------
+    Tuple[np.ndarray, nb.typed.List]
+        A tuple containing:
+        - An array of integers representing the indices of the non-empty bins.
+        - A Numba typed list of arrays containing the intensities for each bin.
+    """
+    start_dim = min_mz - (min_mz % bin_size)
+    end_dim = max_mz + bin_size - (max_mz % bin_size)
+    n_bins = math.ceil((end_dim - start_dim) / bin_size)
+
+    n_spectra = len(spectra)
+
+    bins_indices = -np.ones(n_bins, dtype=np.int32)
+    bins_peaks = nb.typed.List()
+    bins_mz = nb.typed.List()
+    for _ in range(n_bins):
+        nested_list_p = nb.typed.List.empty_list(nb.types.float32)
+        nested_list_m = nb.typed.List.empty_list(nb.types.float32)
+        bins_peaks.append(nested_list_p)
+        bins_mz.append(nested_list_m)
+    bins_spectra_count = np.zeros(n_bins, dtype=np.int32)
+
+    for spec in spectra:
+        bins_peak_presence = np.zeros(n_bins, dtype=np.int32)
+        for mz, intensity in zip(spec.mz, spec.intensity):
+            bin_idx = math.floor((mz - min_mz) / bin_size)
+            if 0 <= bin_idx < n_bins:
+                if bins_indices[bin_idx] == -1:
+                    bins_indices[bin_idx] = bin_idx
+                bins_peaks[bin_idx].append(intensity)
+                bins_mz[bin_idx].append(mz)
+                bins_peak_presence[bin_idx] = 1
+        bins_spectra_count += bins_peak_presence
+    # Mark peaks that appear in less than 70% of the spectra as empty for removal
+    for i in range(n_bins):
+        if bins_indices[i] != -1:
+            if bins_spectra_count[i] < 0.7 * n_spectra:
+                bins_indices[i] = -1
+    # Remove empty bins
+    mask = bins_indices != -1
+    bins_indices = bins_indices[mask]
+    bins_peaks_nb = nb.typed.List()
+    bins_mz_nb = nb.typed.List()
+    for i in bins_indices:
+        bins_peaks_nb.append(typed_list_to_numpy(bins_peaks[i]))
+        bins_mz_nb.append(typed_list_to_numpy(bins_mz[i]))
+
+    return bins_indices, bins_peaks_nb, bins_mz_nb
+
+
+@nb.njit(cache=True)
+def _outlier_rejection(
+    bins_indices: List[int],
+    bins_peaks: nb.typed.List,
+    bins_mz: nb.typed.List,
+    outlier_cutoff_lower: float,
+    outlier_cutoff_upper: float,
+) -> Tuple[nb.typed.List]:
+    """
+    Remove outliers from binned spectra using the sigma clipping algorithm and
+    return the averaged intensities.
+
+    Parameters
+    ----------
+    bins_indices : List[int]
+        The indices of the non-empty bins.
+    bins_peaks : nb.typed.List
+        The intensities for each bin.
+    bins_mz : nb.typed.List
+        The m/z values for each bin.
+    outlier_cutoff_lower : float
+        The number of standard deviations for the lower bound.
+    outlier_cutoff_upper : float
+        The number of standard deviations for the upper bound.
+
+    Returns
+    -------
+    nb.typed.List
+        The cleaned and averaged intensities for each bin.
+    """
+    n_peaks = len(bins_indices)
+    cleaned_bins_peaks = np.zeros(n_peaks, dtype=np.float32)
+    cleaned_bins_mz = np.zeros(n_peaks, dtype=np.float32)
+
+    zero_peaks = np.zeros(len(bins_indices), dtype=np.bool_)
+    for i in range(len(bins_indices)):
+        intensities = bins_peaks[i]
+        mzs = bins_mz[i]
+        if len(intensities) > 2:
+            clipped_p, clipped_m = _sigma_clipping(
+                intensities,
+                mzs,
+                outlier_cutoff_lower,
+                outlier_cutoff_upper,
+            )
+            if len(clipped_p) < 1:
+                zero_peaks[i] = True
+            else:
+                cleaned_bins_peaks[i] = np.mean(clipped_p)
+                cleaned_bins_mz[i] = np.mean(clipped_m)
+        else:
+            cleaned_bins_peaks[i] = np.mean(intensities)
+            cleaned_bins_mz[i] = np.mean(mzs)
+
+    # Return non-empty bins
+    return (
+        bins_indices[~zero_peaks],
+        cleaned_bins_peaks[~zero_peaks],
+        cleaned_bins_mz[~zero_peaks],
+    )
+
+
+@nb.njit(cache=True)
+def _sigma_clipping(
+    intensities: np.ndarray,
+    mzs: np.ndarray,
+    outlier_cutoff_lower: float,
+    outlier_cutoff_upper: float,
+) -> np.ndarray:
+    """
+    Apply sigma clipping to remove outliers from the array.
+
+    Parameters
+    ----------
+    intensities : np.ndarray
+        The array of intensities.
+    mzs : np.ndarray
+        The array of m/z values.
+    outlier_cutoff_lower : float
+        The number of standard deviations for the lower bound.
+    outlier_cutoff_upper : float
+        The number of standard deviations for the upper bound.
+
+    Returns
+    -------
+    np.ndarray
+        The array of intensities with outliers removed.
+    """
+    while len(intensities) > 2:
+        med = np.median(intensities)
+        std = np.std(intensities)
+        if std == 0.0:
+            break
+        # Mask outliers
+        mask = _sigma_clip(
+            intensities, med, std, outlier_cutoff_lower, outlier_cutoff_upper
+        )
+        # Break if no outliers were found
+        if np.sum(mask) == len(intensities):
+            break
+        intensities = intensities[mask]
+        mzs = mzs[mask]
+    return intensities, mzs
+
+
+@nb.njit(cache=True)
+def _sigma_clip(
+    values: np.ndarray,
+    median: float,
+    std: float,
+    outlier_cutoff_lower: float,
+    outlier_cutoff_upper: float,
+) -> np.ndarray:
+    """
+    Label outlier intensities.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        The values to check.
+    median : float
+        The median of the values.
+    std : float
+        The standard deviation of the values.
+    outlier_cutoff_lower : float
+        The number of standard deviations below the median.
+    outlier_cutoff_upper : float
+        The number of standard deviations above the median.
+
+    Returns
+    -------
+    np.ndarray
+        mask:
+            True if the value is not an outlier (keep)
+            False otherwise (remove)
+    """
+    lower_bound = median - outlier_cutoff_lower * std
+    upper_bound = median + outlier_cutoff_upper * std
+    return (values >= lower_bound) & (values <= upper_bound)
+
+
+@nb.njit(cache=True)
+def _construct_average_spectrum(
+    bins_indices: List[int],
+    bins_peaks: nb.typed.List,
+    bins_mz: nb.typed.List,
+    avg_precursor_mz: float,
+    charge: int,
+    avg_rt: float,
+    cluster: int,
+) -> similarity.SpectrumTuple:
+    """
+    Construct the average spectrum from the binned spectra.
+
+    Parameters
+    ----------
+    bins_indices : List[int]
+        The indices of the non-empty bins.
+    bins_peaks : nb.typed.List
+        The intensities for each bin.
+    bins_mz : nb.typed.List
+        The m/z values for each bin
+    avg_precursor_mz : float
+        The average precursor m/z.
+    charge : int
+        The precursor charge.
+    avg_rt : float
+        The average retention time.
+    cluster : int
+        The cluster label.
+
+    Returns
+    -------
+    similarity.SpectrumTuple
+        The average spectrum.
+    """
+    mz = np.empty(len(bins_indices), np.float32)
+    intensity = np.empty(len(bins_indices), np.float32)
+
+    idx = 0
+    for avg_intensity, avg_mz in zip(bins_peaks, bins_mz):
+        # use the middle of the bin as the m/z value
+        mz[idx] = avg_mz
+        intensity[idx] = avg_intensity
+        idx += 1
+
+    return ConsensusTuple(
+        precursor_mz=avg_precursor_mz,
+        precursor_charge=charge,
+        mz=mz,
+        intensity=intensity,
+        retention_time=avg_rt,
+        cluster_id=cluster,
+    )
+
+
+@nb.njit(cache=True)
+def typed_list_to_numpy(lst: nb.typed.List) -> np.ndarray:
+    """
+    Convert a Numba typed list of floats to a Numpy array.
+
+    Parameters
+    ----------
+    lst : nb.typed.List
+        The list of floats to convert.
+
+    Returns
+    -------
+    np.ndarray
+        The converted array.
+    """
+    n = len(lst)
+    arr = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        arr[i] = lst[i]
+    return arr
 
 
 @nb.njit(boundscheck=False)

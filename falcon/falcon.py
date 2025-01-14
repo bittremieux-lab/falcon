@@ -61,6 +61,9 @@ def main(args: Union[str, List[str]] = None) -> int:
     logger.debug("linkage = %s", config.linkage)
     logger.debug("distance_threshold = %.3f", config.distance_threshold)
     logger.debug("min_matched_peaks = %d", config.min_matched_peaks)
+    logger.debug("consensus_method = %s", config.consensus_method)
+    logger.debug("outlier_cutoff_lower = %.2f", config.outlier_cutoff_lower)
+    logger.debug("outlier_cutoff_upper = %.2f", config.outlier_cutoff_upper)
     logger.debug("batch_size = %d", config.batch_size)
     logger.debug("min_peaks = %d", config.min_peaks)
     logger.debug("min_mz_range = %.2f", config.min_mz_range)
@@ -121,6 +124,19 @@ def main(args: Union[str, List[str]] = None) -> int:
         logging.shutdown()
         return 1
 
+    # Check if the spectral averaging configuration is valid.
+    if (
+        config.consensus_method == "average"
+        and config.outlier_cutoff_lower < 1
+        and config.outlier_cutoff_upper < 1
+    ):
+        logger.warning(
+            "Setting both outlier_cutoff_lower and outlier_cutoff_upper "
+            "to values less than 1 can lead have unexpected results. It "
+            "is advised to set either outlier_cutoff_lower or "
+            "outlier_cutoff_upper to a value >= 1."
+        )
+
     _, min_mz, max_mz = spectrum.get_dim(
         config.min_mz, config.max_mz, config.fragment_tol
     )
@@ -174,8 +190,19 @@ def main(args: Union[str, List[str]] = None) -> int:
                 axis=1,
             )
         )
-        # Cluster using the pairwise distance matrix.
-        clusters, medoids = cluster.generate_clusters(
+        # Cluster spectra and get representative spectra.
+        consensus_params = {}
+        if config.consensus_method == "average":
+            consensus_params["min_mz"] = config.min_mz
+            consensus_params["max_mz"] = config.max_mz
+            consensus_params["bin_size"] = 2 * config.fragment_tol
+            consensus_params["outlier_cutoff_lower"] = (
+                config.outlier_cutoff_lower
+            )
+            consensus_params["outlier_cutoff_upper"] = (
+                config.outlier_cutoff_upper
+            )
+        clusters, rep_spectra = cluster.generate_clusters(
             dataset,
             config.linkage,
             config.distance_threshold,
@@ -185,6 +212,8 @@ def main(args: Union[str, List[str]] = None) -> int:
             config.rt_tol,
             config.fragment_tol,
             config.batch_size,
+            config.consensus_method,
+            consensus_params,
         )
         # Make sure that different charges have non-overlapping cluster labels.
         # only change labels that are not -1 (noise)
@@ -196,11 +225,7 @@ def main(args: Union[str, List[str]] = None) -> int:
         clusters_all.append(metadata)
         # Extract identifiers for cluster representatives (medoids).
         if config.export_representatives:
-            representatives.append(
-                dataset.take(medoids)
-                .to_pandas()
-                .apply(spectrum.df_row_to_spec, axis=1)
-            )
+            representatives.extend(rep_spectra)
 
     # Export cluster memberships and representative spectra.
     clusters_all = pd.concat(clusters_all, ignore_index=True).sort_values(
@@ -219,9 +244,6 @@ def main(args: Union[str, List[str]] = None) -> int:
     )
     write_csv_worker.start()
     if config.export_representatives:
-        representatives = pd.concat(
-            representatives, ignore_index=True
-        ).tolist()
         logger.info(
             "Export %d cluster representative spectra to output file %s",
             len(representatives),
@@ -508,6 +530,13 @@ def _write_cluster_info(clusters: pd.DataFrame) -> None:
             f"# distance_threshold = {config.distance_threshold:.3f}\n"
         )
         f_out.write(f"# min_matched_peaks = {config.min_matched_peaks}\n")
+        f_out.write(f"# consensus_method = {config.consensus_method}\n")
+        f_out.write(
+            f"# outlier_cutoff_lower = {config.outlier_cutoff_lower:.2f}\n"
+        )
+        f_out.write(
+            f"# outlier_cutoff_upper = {config.outlier_cutoff_upper:.2f}\n"
+        )
         f_out.write(f"# batch_size = {config.batch_size}\n")
         f_out.write(f"# min_peaks = {config.min_peaks}\n")
         f_out.write(f"# min_mz_range = {config.min_mz_range:.2f}\n")
