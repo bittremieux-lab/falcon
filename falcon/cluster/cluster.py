@@ -828,7 +828,7 @@ def _spectrum_binning(
     # Mark peaks that appear in less than 70% of the spectra as empty for removal
     for i in range(n_bins):
         if bins_indices[i] != -1:
-            if len(bins_spectra_count[i]) < 0.7 * n_spectra:
+            if bins_spectra_count[i] < 0.7 * n_spectra:
                 bins_indices[i] = -1
     # Remove empty bins
     mask = bins_indices != -1
