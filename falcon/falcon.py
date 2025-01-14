@@ -292,7 +292,7 @@ def _prepare_spectra(process_spectrum: Callable) -> Set[int]:
     max_spectra_in_memory = 1_000_000
     spectra_queue = queue.Queue(maxsize=max_spectra_in_memory)
     # Start the lance writers.
-    lance_locks = collections.defaultdict(multiprocessing.Lock)
+    lance_lock = multiprocessing.Lock()
     charges = set()
     schema = pa.schema(
         [
@@ -308,7 +308,7 @@ def _prepare_spectra(process_spectrum: Callable) -> Set[int]:
     lance_writers = multiprocessing.pool.ThreadPool(
         max_file_workers,
         _write_spectra_lance,
-        (spectra_queue, lance_locks, schema, charges),
+        (spectra_queue, lance_lock, schema, charges),
     )
     # Read the peak files and put their spectra in the queue for consumption
     # by the lance writers.
@@ -416,7 +416,7 @@ def _read_spectra(
 
 def _write_spectra_lance(
     spectra_queue: queue.Queue,
-    lance_locks: Dict[int, multiprocessing.synchronize.Lock],
+    lance_lock: multiprocessing.synchronize.Lock,
     schema: pa.Schema,
     charges: Set,
 ) -> None:
@@ -427,8 +427,8 @@ def _write_spectra_lance(
     ----------
     spectra_queue : queue.Queue
         Queue from which to read spectra for writing to pickle files.
-    lance_locks : Dict[int, multiprocessing.synchronize.Lock]
-        Locks to synchronize writing to the dataset.
+    lance_lock : multiprocessing.synchronize.Lock
+        Lock to synchronize writing to the dataset.
     schema : pa.Schema
         The schema of the dataset.
     charges : set
@@ -445,7 +445,7 @@ def _write_spectra_lance(
                 _write_to_dataset(
                     spec_to_write[charge],
                     charge,
-                    lance_locks[charge],
+                    lance_lock,
                     schema,
                     config.work_dir,
                 )
@@ -458,7 +458,7 @@ def _write_spectra_lance(
             _write_to_dataset(
                 spec_to_write[charge],
                 charge,
-                lance_locks[charge],
+                lance_lock,
                 schema,
                 config.work_dir,
             )
@@ -481,7 +481,7 @@ def _write_to_dataset(
         The spectra to write.
     charge : int
         The precursor charge of the spectra.
-    lock : multiprocessing.Lock
+    lock : multiprocessing.synchronize.Lock
         Lock to synchronize writing to the dataset.
     schema : pa.Schema
         The schema of the dataset.
