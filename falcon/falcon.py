@@ -527,4 +527,6 @@ def _write_cluster_info(clusters: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("fork", force=True)
+
     sys.exit(main())
