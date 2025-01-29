@@ -124,14 +124,14 @@ class Config:
             "(default: %(default)s). Should be one of 'medoid', 'average'.",
         )
         self._parser.add_argument(
-            "--n_min",
+            "--outlier_cutoff_lower",
             type=float,
             default=1.5,
             help="Number of standard deviations below the median for outlier rejection "
             "(default: %(default)s). Only used when consensus_method='average'.",
         )
         self._parser.add_argument(
-            "--n_max",
+            "--outlier_cutoff_upper",
             type=float,
             default=1.5,
             help="Number of standard deviations above the median for outlier rejection "

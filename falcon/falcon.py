@@ -47,8 +47,8 @@ def main(args: Union[str, List[str]] = None) -> int:
     logger.debug("distance_threshold = %.3f", config.distance_threshold)
     logger.debug("min_matched_peaks = %d", config.min_matched_peaks)
     logger.debug("consensus_method = %s", config.consensus_method)
-    logger.debug("n_min = %.2f", config.n_min)
-    logger.debug("n_max = %.2f", config.n_max)
+    logger.debug("outlier_cutoff_lower = %.2f", config.outlier_cutoff_lower)
+    logger.debug("outlier_cutoff_upper = %.2f", config.outlier_cutoff_upper)
     logger.debug("batch_size = %d", config.batch_size)
     logger.debug("min_peaks = %d", config.min_peaks)
     logger.debug("min_mz_range = %.2f", config.min_mz_range)
@@ -112,13 +112,14 @@ def main(args: Union[str, List[str]] = None) -> int:
     # Check if the spectral averaging configuration is valid.
     if (
         config.consensus_method == "average"
-        and config.n_min < 1
-        and config.n_max < 1
+        and config.outlier_cutoff_lower < 1
+        and config.outlier_cutoff_upper < 1
     ):
         logger.warning(
-            "Setting both n_min and n_max to values less than 1 "
-            "can lead have unexpected results. It is advised to set "
-            "either n_min or n_max to a value >= 1."
+            "Setting both outlier_cutoff_lower and outlier_cutoff_upper "
+            "to values less than 1 can lead have unexpected results. It "
+            "is advised to set either outlier_cutoff_lower or "
+            "outlier_cutoff_upper to a value >= 1."
         )
 
     _, min_mz, max_mz = spectrum.get_dim(
@@ -174,7 +175,18 @@ def main(args: Union[str, List[str]] = None) -> int:
                 axis=1,
             )
         )
-        # Cluster using the pairwise distance matrix.
+        # Cluster spectra and get representative spectra.
+        consensus_params = {}
+        if config.consensus_method == "average":
+            consensus_params["min_mz"] = config.min_mz
+            consensus_params["max_mz"] = config.max_mz
+            consensus_params["bin_size"] = 2 * config.fragment_tol
+            consensus_params["outlier_cutoff_lower"] = (
+                config.outlier_cutoff_lower
+            )
+            consensus_params["outlier_cutoff_upper"] = (
+                config.outlier_cutoff_upper
+            )
         clusters, rep_spectra = cluster.generate_clusters(
             dataset,
             config.linkage,
@@ -184,13 +196,9 @@ def main(args: Union[str, List[str]] = None) -> int:
             config.precursor_tol[1],
             config.rt_tol,
             config.fragment_tol,
-            config.consensus_method,
-            config.min_mz,
-            config.max_mz,
-            2 * config.fragment_tol,
-            config.n_min,
-            config.n_max,
             config.batch_size,
+            config.consensus_method,
+            consensus_params,
         )
         # Make sure that different charges have non-overlapping cluster labels.
         # only change labels that are not -1 (noise)
@@ -269,7 +277,7 @@ def _prepare_spectra(process_spectrum: Callable) -> Set[int]:
     max_spectra_in_memory = 1_000_000
     spectra_queue = queue.Queue(maxsize=max_spectra_in_memory)
     # Start the lance writers.
-    lance_locks = collections.defaultdict(multiprocessing.Lock)
+    lance_lock = multiprocessing.Lock()
     charges = set()
     schema = pa.schema(
         [
@@ -285,7 +293,7 @@ def _prepare_spectra(process_spectrum: Callable) -> Set[int]:
     lance_writers = multiprocessing.pool.ThreadPool(
         max_file_workers,
         _write_spectra_lance,
-        (spectra_queue, lance_locks, schema, charges),
+        (spectra_queue, lance_lock, schema, charges),
     )
     # Read the peak files and put their spectra in the queue for consumption
     # by the lance writers.
@@ -393,7 +401,7 @@ def _read_spectra(
 
 def _write_spectra_lance(
     spectra_queue: queue.Queue,
-    lance_locks: Dict[int, multiprocessing.synchronize.Lock],
+    lance_lock: multiprocessing.synchronize.Lock,
     schema: pa.Schema,
     charges: Set,
 ) -> None:
@@ -404,8 +412,8 @@ def _write_spectra_lance(
     ----------
     spectra_queue : queue.Queue
         Queue from which to read spectra for writing to pickle files.
-    lance_locks : Dict[int, multiprocessing.synchronize.Lock]
-        Locks to synchronize writing to the dataset.
+    lance_lock : multiprocessing.synchronize.Lock
+        Lock to synchronize writing to the dataset.
     schema : pa.Schema
         The schema of the dataset.
     charges : set
@@ -422,7 +430,7 @@ def _write_spectra_lance(
                 _write_to_dataset(
                     spec_to_write[charge],
                     charge,
-                    lance_locks[charge],
+                    lance_lock,
                     schema,
                     config.work_dir,
                 )
@@ -435,7 +443,7 @@ def _write_spectra_lance(
             _write_to_dataset(
                 spec_to_write[charge],
                 charge,
-                lance_locks[charge],
+                lance_lock,
                 schema,
                 config.work_dir,
             )
@@ -458,7 +466,7 @@ def _write_to_dataset(
         The spectra to write.
     charge : int
         The precursor charge of the spectra.
-    lock : multiprocessing.Lock
+    lock : multiprocessing.synchronize.Lock
         Lock to synchronize writing to the dataset.
     schema : pa.Schema
         The schema of the dataset.
@@ -508,8 +516,12 @@ def _write_cluster_info(clusters: pd.DataFrame) -> None:
         )
         f_out.write(f"# min_matched_peaks = {config.min_matched_peaks}\n")
         f_out.write(f"# consensus_method = {config.consensus_method}\n")
-        f_out.write(f"# n_min = {config.n_min:.2f}\n")
-        f_out.write(f"# n_max = {config.n_max:.2f}\n")
+        f_out.write(
+            f"# outlier_cutoff_lower = {config.outlier_cutoff_lower:.2f}\n"
+        )
+        f_out.write(
+            f"# outlier_cutoff_upper = {config.outlier_cutoff_upper:.2f}\n"
+        )
         f_out.write(f"# batch_size = {config.batch_size}\n")
         f_out.write(f"# min_peaks = {config.min_peaks}\n")
         f_out.write(f"# min_mz_range = {config.min_mz_range:.2f}\n")
