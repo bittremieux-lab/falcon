@@ -199,6 +199,7 @@ def main(args: Union[str, List[str]] = None) -> int:
             config.batch_size,
             config.consensus_method,
             consensus_params,
+            config.lazy_loading_off,
         )
         # Make sure that different charges have non-overlapping cluster labels.
         # only change labels that are not -1 (noise)

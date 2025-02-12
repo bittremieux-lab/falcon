@@ -5,13 +5,13 @@ import math
 import multiprocessing
 import tempfile
 from functools import partial
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import fastcluster
-import joblib
 import lance
 import numba as nb
 import numpy as np
+import pandas as pd
 import scipy.cluster.hierarchy as sch
 import spectrum_utils.utils as suu
 from scipy.cluster.hierarchy import fcluster
@@ -47,6 +47,7 @@ def generate_clusters(
     batch_size: int,
     consensus_method: str,
     consensus_params: dict,
+    lazy_loading_off: bool = False,
 ) -> np.ndarray:
     """
     Hierarchical clustering of the given pairwise distance matrix.
@@ -77,6 +78,8 @@ def generate_clusters(
         'medoid' or 'average'.
     consensus_params : dict
         Additional parameters for the consensus spectrum computation.
+    lazy_loading_off : bool
+        Whether to use lazy loading of the dataset.
 
     Returns
     -------
@@ -91,7 +94,18 @@ def generate_clusters(
         min_samples,
     )
     # Sort the metadata by increasing precursor m/z for easy subsetting.
-    data = dataset.to_table(columns=["precursor_mz"]).to_pandas()
+    if not lazy_loading_off:
+        data = dataset.to_table(columns=["precursor_mz"]).to_pandas()
+    else:
+        data = dataset.to_table(
+            columns=[
+                "precursor_mz",
+                "precursor_charge",
+                "retention_time",
+                "mz",
+                "intensity",
+            ]
+        ).to_pandas()
     data["row_id"] = data.index
     data.sort_values("precursor_mz", inplace=True)
     # Cluster per contiguous block of precursor m/z's (relative to the
@@ -112,56 +126,21 @@ def generate_clusters(
             total=len(data), desc="Clustering", unit="spectra", smoothing=0
         ) as pbar:
             idx = data.index.values
-            mz = data["precursor_mz"].values
+            mzs = data["precursor_mz"].values
             splits = _get_precursor_mz_splits(
-                mz, precursor_tol_mass, precursor_tol_mode, batch_size
+                mzs, precursor_tol_mass, precursor_tol_mode, batch_size
             )
             # Per m/z split clustering.
-            chunks, single_spectra_tasks, two_spectra_tasks = (
-                cost_based_chunking(splits, multiprocessing.cpu_count() - 1)
+            chunks = cost_based_chunking(
+                splits, multiprocessing.cpu_count() - 1
             )
-            # Process single-spectrum m/z splits
-            for rep_spectrum in joblib.Parallel(
-                n_jobs=multiprocessing.cpu_count(), backend="threading"
-            )(
-                joblib.delayed(cluster_1_spectrum)(
-                    dataset,
-                    data["row_id"].values[spec_idx],
-                )
-                for _, spec_idx in single_spectra_tasks
-            ):
-                rep_spectra.append(rep_spectrum)
-                pbar.update(1)
-            # Process two-spectrum m/z splits
-            for i, rep_spectra_chunk in enumerate(
-                joblib.Parallel(
-                    n_jobs=multiprocessing.cpu_count(), backend="threading"
-                )(
-                    joblib.delayed(cluster_2_spectra)(
-                        dataset,
-                        data.row_id[spec_idx],
-                        data.row_id[spec_idx + 1],
-                        fragment_tol,
-                        distance_threshold,
-                        min_matches,
-                        consensus_method,
-                        consensus_params,
-                    )
-                    for _, spec_idx in two_spectra_tasks
-                )
-            ):
-                rep_spectra.extend(rep_spectra_chunk)
-                # Clustered two spectra into one cluster.
-                if len(rep_spectra_chunk) == 1:
-                    spec_idx = two_spectra_tasks[i][1]
-                    cluster_labels[spec_idx : spec_idx + 2] = 0
-                pbar.update(2)
-            # Process multi-spectrum m/z splits
+            # Cluster m/z splits
             if len(chunks) > 0:
                 # Process chunks
                 process_chunk = partial(
                     cluster_chunk,
                     dataset=dataset,
+                    data=data if lazy_loading_off else None,
                     linkage=linkage,
                     distance_threshold=distance_threshold,
                     min_matches=min_matches,
@@ -179,7 +158,7 @@ def generate_clusters(
                     for task_id, (interval_start, interval_stop) in chunk:
                         row_ids = data.row_id[interval_start:interval_stop]
                         idx_interval = idx[interval_start:interval_stop]
-                        mz_interval = mz[interval_start:interval_stop]
+                        mz_interval = mzs[interval_start:interval_stop]
                         data_chunk.append(
                             (
                                 task_id,
@@ -209,6 +188,7 @@ def generate_clusters(
                         cluster_labels[
                             splits[task_id] : splits[task_id + 1]
                         ] = labels
+                        pbar.update(len(labels))
             max_label = _assign_global_cluster_labels(
                 cluster_labels, splits, max_label
             )
@@ -282,11 +262,9 @@ def _get_precursor_mz_splits(
     return splits
 
 
-def cost_based_chunking(tasks: List[int], num_chunks: int) -> Tuple[
-    List[List[Tuple[int, Tuple[int, int]]]],
-    List[Tuple[int, int]],
-    List[Tuple[int, int]],
-]:
+def cost_based_chunking(
+    tasks: List[int], num_chunks: int
+) -> List[List[Tuple[int, Tuple[int, int]]]]:
     """
     Groups tasks into chunks based on estimated computational costs.
 
@@ -299,14 +277,9 @@ def cost_based_chunking(tasks: List[int], num_chunks: int) -> Tuple[
 
     Returns
     -------
-    Tuple[List[List[Tuple[int, Tuple[int, int]]], List[Tuple[int, int]], List[Tuple[int, int]]]
-        A tuple containing the chunks, single-spectra tasks, and two-spectra tasks:
-            Each chunk is a list of tuples containing the index of the task and the
-            m/z split bounds.
-            Each single-spectra task is a tuple containing the index of the task and the
-            spectrum index.
-            Each two-spectra task is a tuple containing the index of the task and the
-            lower m/z split bound.
+    List[List[Tuple[int, Tuple[int, int]]]
+        A tuple containing the chunks. Each chunk is a list of tuples containing
+        the index of the task and the m/z split bounds.
     """
     split_tuples = [(tasks[i], tasks[i + 1]) for i in range(len(tasks) - 1)]
     indexed_tasks = list(enumerate(split_tuples))
@@ -315,29 +288,23 @@ def cost_based_chunking(tasks: List[int], num_chunks: int) -> Tuple[
     # Initialize chunks and their cumulative costs
     chunks = [[] for _ in range(num_chunks)]
     costs = [0] * num_chunks
-    single_spectra_tasks = []
-    two_spectra_tasks = []
 
     # Assign tasks to the chunk with the least cumulative cost
     for index, task in indexed_tasks:
-        if task[1] - task[0] == 1:
-            single_spectra_tasks.append((index, task[0]))
-        elif task[1] - task[0] == 2:
-            two_spectra_tasks.append((index, task[0]))
-        else:
-            idx = costs.index(min(costs))  # Find the chunk with the least cost
-            chunks[idx].append((index, task))
-            costs[idx] += (task[1] - task[0]) ** 2
+        idx = costs.index(min(costs))  # Find the chunk with the least cost
+        chunks[idx].append((index, task))
+        costs[idx] += (task[1] - task[0]) ** 2
 
     # Remove empty chunks
     chunks = [chunk for chunk in chunks if chunk]
 
-    return chunks, single_spectra_tasks, two_spectra_tasks
+    return chunks
 
 
 def cluster_chunk(
     chunk: List[Tuple[int, Tuple[int, int]]],
-    dataset: lance.LanceDataset,
+    dataset: Optional[lance.LanceDataset],
+    data: Optional[pd.DataFrame],
     linkage: str,
     distance_threshold: float,
     min_matches: int,
@@ -356,8 +323,10 @@ def cluster_chunk(
     chunk : List[Tuple[int, Tuple[int, int]]]
         The cluster tasks as a list of tuples containing the index of the task and the
         m/z split bounds.
-    dataset : lance.LanceDataset
+    dataset : Optional[lance.LanceDataset]
         The dataset containing the spectra to be clustered.
+    data : Optional[pd.DataFrame]
+        The spectra to be clustered (only when not lazy loading).
     linkage : str
         Linkage method to calculate the cluster distances.
     distance_threshold : float
@@ -398,6 +367,7 @@ def cluster_chunk(
             i,
             _cluster_mz_interval(
                 dataset,
+                data,
                 row_ids,
                 idx,
                 mzs,
@@ -417,7 +387,8 @@ def cluster_chunk(
 
 
 def _cluster_mz_interval(
-    dataset: lance.LanceDataset,
+    dataset: Optional[lance.LanceDataset],
+    data: Optional[pd.DataFrame],
     row_ids: List[int],
     idx: np.ndarray,
     mzs: np.ndarray,
@@ -436,8 +407,10 @@ def _cluster_mz_interval(
 
     Parameters
     ----------
-    dataset : lance.LanceDataset
+    dataset : Optional[lance.LanceDataset]
         The dataset containing the spectra to be clustered.
+    data : Optional[pd.DataFrame]
+        The spectra to be clustered (only when not lazy loading).
     row_ids : List[int]
         The row ids of the spectra in the current interval.
     idx : np.ndarray
@@ -471,16 +444,19 @@ def _cluster_mz_interval(
     np.ndarray
         List of representative spectra for each cluster.
     """
-    spectra = dataset.take(
-        indices=row_ids,
-        columns=[
-            "precursor_mz",
-            "precursor_charge",
-            "retention_time",
-            "mz",
-            "intensity",
-        ],
-    ).to_pandas()
+    if dataset is not None and data is None:
+        spectra = dataset.take(
+            indices=row_ids,
+            columns=[
+                "precursor_mz",
+                "precursor_charge",
+                "retention_time",
+                "mz",
+                "intensity",
+            ],
+        ).to_pandas()
+    else:
+        spectra = data.loc[row_ids]
     rts = spectra["retention_time"].values
     spectra = spectra.apply(
         similarity.df_row_to_spectrum_tuple, axis=1
