@@ -1432,7 +1432,41 @@ def compute_condensed_distance_matrix(
             shape=(n * (n - 1) // 2,),
         )
 
-        def cosine_worker(i, j):
+        condensed_distance_matrix_parallel(
+            condensed_dist_matrix,
+            spec_tuples,
+            fragment_mz_tol,
+            min_matches,
+        )
+
+        return condensed_dist_matrix
+
+
+@nb.njit(parallel=True)
+def condensed_distance_matrix_parallel(
+    condensed_dist_matrix: np.ndarray,
+    spec_tuples: List[similarity.SpectrumTuple],
+    fragment_mz_tol: float,
+    min_matches: int,
+) -> None:
+    """
+    Compute the condensed pairwise distance matrix for the given spectra.
+
+    Parameters
+    ----------
+    condensed_dist_matrix : np.ndarray
+        The condensed pairwise distance matrix.
+    spec_tuples : List[similarity.SpectrumTuple]
+        The spectra to compute the pairwise distance matrix for.
+    fragment_mz_tol : float
+        The fragment m/z tolerance.
+    min_matches : int
+        The minimum number of matched peaks to consider the spectra similar.
+    """
+    n = len(spec_tuples)
+
+    for i in nb.prange(n - 1):
+        for j in range(i + 1, n):
             spec_tup1 = spec_tuples[i]
             spec_tup2 = spec_tuples[j]
             sim, n_match = similarity.cosine_fast(
@@ -1443,12 +1477,6 @@ def compute_condensed_distance_matrix(
             distance = 1.0 - sim
             idx = condensed_index(i, j, n)
             condensed_dist_matrix[idx] = distance
-
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                cosine_worker(i, j)
-
-        return condensed_dist_matrix
 
 
 @nb.njit
